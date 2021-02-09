@@ -1,0 +1,358 @@
+---
+title: "**Associations between socio-economic characteristics and chemical concentrations in the United States**"
+author: "Girish Palya"
+date: '`r Sys.Date()`'
+output:
+  html_document:
+    toc: yes
+    number_sections: yes
+    code_folding: hide
+    theme: cosmo
+    highlight: tango
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Introduction
+
+In this kernel we are going to use *Apriori* algorithm for Association rule mining (ARM). We will identify associations between socio-economic characteristics of US counties and their exposure to toxic pollutants from emissions.
+
+Pollutant data comes from [2014 National Air Toxins Assessment](https://www.epa.gov/national-air-toxics-assessment/2014-nata-assessment-results) published by the EPA. Data on socio-economic characteristics of US counties comes from [US DOA](https://www.ers.usda.gov/data-products/county-level-data-sets/download-data/).
+
+A similar [study](https://www.ncbi.nlm.nih.gov/pmc/articles/PMC6733034/#S6title) has been done in the past where investigators studied the association of race/minority status with exposure to pollutants -- a key focus of EJ (Environmental Justice) initiative. We shall take a different approach, and show that socio-economic variables like poverty, unemployment, education, etc. have meaningful associations to pollutant exposure and health risk.
+
+Five pollutants are chosen for analysis: acetaldehyde, benzene, cyanide, particulate matter components of diesel engine emissions (diesel PM), and toluene. These chemicals are selected based on their potential for health impacts as well as their relevance to mobile source (i.e., vehicular traffic) and industrial
+emissions. The aforementioned study also includes these chemicals.
+
+All variables are measured per county. Socio-economic variables include birth rate, death rate, education level (weighted average of 4 levels: without high school diploma, high school degree, associate degree, and bachelor degree and higher), unemployment rate, poverty rate, international (in/out) migration, and net (in/out) migration.
+
+Totally there are 56 labels available for association algorithm, and these labels are derived from variables as follows: The range of values of each variable is divided into 4 quartiles, and each county in the US is assigned to one of the 4 quartiles based on the value of the corresponding variable. Post-fixes "=Q1" to "=Q4" are added to each variable name to derive the name of the label. There are 5 variables related to 5 chemical pollutants, and 9 variables related to socio-economic factors, resulting in a total of 14 variables and 56 labels. The 1st quartile (Q1) includes the lowest values of a variable and 4th quartile (Q4) has the highest values.
+
+# Data Preparation
+
+We download the data directly from [EPA](https://www.epa.gov/national-air-toxics-assessment/2014-nata-assessment-results) and [DOA](https://www.ers.usda.gov/data-products/county-level-data-sets/download-data/). This process takes less than a minute at average internet speeds. Both EPA and DOA provide county level data. Counties are identified by their FIPS number. 
+
+```{r message=FALSE, warning=FALSE}
+library(data.table)
+library(magrittr)
+library(ggplot2)
+library(arules)
+library(arulesViz)
+library(knitr)
+library(rio)
+library(stringr)
+library(gridExtra)
+library(dplyr)
+
+# A utility function to download spreadsheets and strip
+#   out unneeded rows.
+read_xlsx <- function(base, url, skip = 0, fips = "FIPS") {
+  url <- paste0(base, url) 
+  temp <- rio::import(file = url, which = 1, skip = skip) 
+  setDT(temp)
+  # Remove aggregate numbers for US and states
+  return(temp[substr(get(fips), 3, 5) != '000'])
+}
+```
+
+## Chemical data
+
+Distributions of pollutants show long right tail of outliers. A minority of communities are bearing a significant brunt of health risk.     
+
+```{r fig.height=3, fig.width=7}
+base <- 'https://www.epa.gov/sites/production/files/2018-08/'
+chem <-
+  read_xlsx(base, 'nata2014v2_national_immuhi_by_tract_poll.xlsx')
+chem <- chem[, .(BENZENE = mean(BENZENE)), by = FIPS]
+temp <-
+  read_xlsx(base, 'nata2014v2_national_resphi_by_tract_poll.xlsx')
+temp <- temp[, .(ACETALDEHYDE = mean(ACETALDEHYDE),
+                 DIESEL = mean(`DIESEL PM`)), by = FIPS]
+chem <-
+  merge(chem, temp[, .(FIPS, ACETALDEHYDE, DIESEL)], by = c("FIPS"))
+temp <-
+  read_xlsx(base, 'nata2014v2_national_neurhi_by_tract_poll.xlsx')
+temp <- temp[, .(TOLUENE = mean(TOLUENE),
+                 CYANIDE = mean(`CYANIDE COMPOUNDS`)), by = FIPS]
+chem <- merge(chem, temp[, .(FIPS, TOLUENE, CYANIDE)], by = c("FIPS"))
+# tidy the data (refer to Hadley Wickam's recommendations)
+chem <- melt(chem, id.vars = c("FIPS"))
+# plot
+plots <- lapply(unique(chem$variable), function(x)
+  ggplot(chem[variable == x], aes(value, variable)) +
+    geom_boxplot() +
+    theme(axis.title.x = element_blank(),
+          axis.title.y = element_blank()))
+grid.arrange(grobs = plots, ncol = 2)
+```
+
+Continuous data is not suitable for mining association rules. Hence we convert the range of values into 4 quartiles. As you'd expect, frequency plot of quartile labels results in equal height bars since each quartile has a quarter of samples.
+
+
+```{r fig.height=3, fig.width=7}
+# This function returns a data.table of quartile labels 
+#   and FIPS numbers.
+quartile_label <- function(dt) {
+  temp <- data.table(FIPS = character(), Label = factor())
+  for (fac in unique(dt$variable)) {
+    fips <- dt[variable == fac, FIPS]
+    quartile <- quantile(dt[variable == fac, value],
+                         probs = 0:4 / 4)
+    levels <- cut(
+      dt[variable == fac, value],
+      quartile,
+      include.lowest = TRUE,
+      labels = sapply(1:4, function(x)
+        paste0(fac, "=Q", x))
+    )
+    temp <- rbind(temp, data.table(FIPS = fips, Label = levels))
+  }
+  return(temp)
+}
+
+chem_qrt <- quartile_label(chem)
+trans <- as(split(chem_qrt[, Label], chem_qrt[, FIPS]), "transactions")
+itemFrequencyPlot(trans, topN=20, type="absolute", main="Item Frequency",
+                  ylab="Frequency (absolute)") 
+```
+
+## Socio-economic Data
+
+
+### Population
+
+[Data Set](https://www.ers.usda.gov/data-products/county-level-data-sets/download-data/) contains data from year 2011 to 2019. Since chemical data is provided only for 2014, we average the variable values from years 2011 to 2014.
+
+All variables exhibit significant outliers. International migration is skewed more towards
+immigration into counties.
+
+```{r fig.height=2, fig.width=7}
+# population data
+base <- 'https://www.ers.usda.gov/webdocs/DataFiles/48747/'
+pop <- read_xlsx(base,
+                 'PopulationEstimates.xls?v=8087',
+                 skip = 2,
+                 fips = "FIPStxt")
+# Tidy the data set and calculate average over 2011 to 2014
+pop_cols <- c("FIPStxt", sapply(1:4, function(yr)
+  sapply(c("birth", "death", "INTERNATIONAL_MIG", "NET_MIG"),
+         function(x)
+           paste0("R_", x, "_201", yr), USE.NAMES = F)))
+# some column names are actually combination of 2variables
+#   (population variable and year)
+pop <- melt(pop[, ..pop_cols], id.vars = "FIPStxt", na.rm = T)
+# add a new column for year
+pop <- pop[, .(
+  FIPS = FIPStxt,
+  variable = str_sub(variable, 1,-6),
+  Year = str_sub(variable,-4,-1),
+  value
+)]
+# Split migration data into in/out migration, so they 
+#   can be considered separately. Replace variable 
+#   values to something more readable
+pop_tidy <- pop[, .(
+  FIPS,
+  variable = case_when(
+    variable == "R_birth" ~ "birth_rate",
+    variable == "R_death" ~ "death_rate",
+    variable == "R_NET_MIG" &
+      value < 0 ~ "net_out_migration_rate",
+    variable == "R_NET_MIG" &
+      value >= 0 ~ "net_in_migration_rate",
+    variable == "R_INTERNATIONAL_MIG" &
+      value < 0 ~ "intl_out_migration_rate",
+    variable == "R_INTERNATIONAL_MIG" &
+      value >= 0 ~ "intl_in_migration_rate",
+  ),
+  value
+)][, .(FIPS, variable, value = ifelse(
+  (variable == "net_out_migration_rate" |
+     variable == "intl_out_migration_rate") & 
+    value < 0,
+  abs(value), value))]
+# calculate average over years 2011 - 2014.
+pop_tidy <- pop_tidy[, .(value = mean(value)),  
+                     by = c("FIPS", "variable")]
+# plot
+pop_tidy %>% 
+  ggplot(aes(value, variable)) +
+  geom_boxplot() +
+  theme(axis.title.x = element_blank(),
+        axis.title.y = element_blank())
+```
+
+### Education
+
+Education level is captured in 4 variables: percent of population 1) without high school education, 2) with high school diploma, 3) with associate_degree, and 4) with bachelor degree and higher. These four numbers sum up to 100. We will reduce this to a single variable "education_level" by taking a weighted average.
+
+```{r fig.height=1, fig.width=7}
+edu <- read_xlsx(base,
+                 'Education.xls?v=8087',
+                 skip = 4,
+                 fips = "FIPS Code")
+# weighted average
+edu <-
+  edu[, .(FIPS = edu[[1]],
+          education_level = (edu[[36]] + 2 * edu[[37]] +
+                               3 * edu[[38]] + 4 * edu[[39]]) / 100)]
+edu_tidy <- melt(edu, id.vars = c("FIPS"), na.rm = T)
+edu_tidy %>%
+  ggplot(aes(value, variable)) +
+  geom_boxplot() +
+  theme(axis.title.x = element_blank(),
+        axis.title.y = element_blank())
+```
+
+### Poverty and unemployment
+
+```{r fig.height=2, fig.width=7}
+# Poverty
+pov <- read_xlsx(base,
+                 'PovertyEstimates.xls?v=8087',
+                 skip = 4,
+                 fips = "FIPStxt")
+pov <- pov[, .(FIPS = FIPStxt, poverty_rate = PCTPOVALL_2019)]
+pov_tidy <- melt(pov, id.vars = c("FIPS"), na.rm = T)
+pov_plot <- pov_tidy %>%
+  ggplot(aes(value, variable)) +
+  geom_boxplot() +
+  theme(axis.title.x = element_blank(),
+        axis.title.y = element_blank())
+# Unemployment
+unem <- read_xlsx(base,
+                  'Unemployment.xls?v=8087',
+                  skip = 4,
+                  fips = "fips_txt")
+unem <- unem[, .(FIPS = fips_txt,
+                 unemployment_rate = Unemployment_rate_2014)]
+unem_tidy <- melt(unem, id.vars = c("FIPS"), na.rm = T)
+unem_plot <- unem_tidy %>%
+  ggplot(aes(value, variable)) +
+  geom_boxplot() +
+  theme(axis.title.x = element_blank(),
+        axis.title.y = element_blank())
+grid.arrange(pov_plot, unem_plot, nrow = 2)
+```
+
+# Association rules from Apriori algorithm
+
+Since we are interested in predicting the association of socio-economic factors to pollutants we confine the chemical labels to the RHS and socio-economic factors (labels) to the LHS.
+
+## Choice of support and confidence thresholds
+
+The number of rules generated by the algorithm depends on the threshold set for support and confidence. We shall determine this relationship before deciding on the optimal threshold levels for support and confidence.
+
+In the following graphs we can see the number of rules generated with a support level of 20%, 10%, 9%, and 7%.
+
+```{r}
+# Create transaction list containing all variables (we can filter later)
+qrts <- rbind(
+  quartile_label(pop_tidy),
+  quartile_label(edu_tidy),
+  quartile_label(pov_tidy),
+  quartile_label(unem_tidy),
+  chem_qrt
+)
+trans <- as(split(qrts[, Label], qrts[, FIPS]), "transactions")
+# plot
+support_levels <- c(0.2, 0.1, 0.09, 0.07)
+confidence_levels <- seq(0.9, 0.2, by = -0.1)
+rule_count <- data.table(support = numeric(),
+                         confidence = numeric(),
+                         num_rules = integer()) 
+for (sp in support_levels) {
+  for (cn in confidence_levels) {
+    rcount <- length(apriori(
+      trans,
+      parameter = list(
+        sup = sp,
+        conf = cn,
+        target = "rules"
+      ),
+      appearance = list(rhs = unique(chem_qrt$Label)),
+      control = list(verbose = F)
+    ))
+    rule_count <- rbind(rule_count, list(sp, cn, rcount))
+  } 
+}
+ggplot(data=rule_count, aes(x=confidence)) +
+  geom_point(aes(y=num_rules, colour=as.factor(support))) +
+  geom_line(aes(y=num_rules, group=as.factor(support), 
+                colour=as.factor(support))) +
+  labs(x="Confidence levels", y="Number of rules found") +
+  guides(color=guide_legend(title="Support levels"))
+```
+
+## Generate association rules
+
+```{r}
+# In apriori algorithm, limit RHS to chemical variables only
+rules <- apriori(
+  trans,
+  parameter = list(sup = 0.05,
+                   conf = 0.5, target = "rules"),
+  appearance = list(rhs = unique(chem_qrt$Label)),
+  control = list(verbose = F)
+)
+```
+
+Recall that support is defined as the  proportion of transactions that contain the item set, and confidence is the conditional probability of the co-occurrence of both LHS and RHS. Lift is the conditional probability of rule support given supports of the LHS and RHS. High values of support, confidence, and lift are indicative of a strong association rule.
+
+A minimum support threshold of 5% and minimum confidence threshold of 50% was used to  obtain `r length(rules)` rules. 
+
+## Interpret association rules
+
+We will filter rules that have high pollutant exposure (4th quartile), and order them by confidence. In the following tables, rules are ordered by confidence.
+
+Counties with high proportion of people with bachelor (and higher) degrees (education_level=Q4), low death rate (young) and with high net international immigration  have high exposure to diesel. Specifically, 69% of these counties are associated with high diesel exposure. In addition, counties with low unemployment and low poverty are associated with exposure to benzene and toluene as well. These counties likely contain densely populated cities with a vibrant economy. The nature of these associations call into question the motivation behind the [earlier study](https://www.ncbi.nlm.nih.gov/pmc/articles/PMC6733034/#S6title), where 'race minority' vs 'white' was the central focus.
+
+```{r}
+df <- DATAFRAME(rules)[, c(1:4, 6:7)]
+data.table(df)[grepl('Q4', RHS)][order(-confidence)] %>% kable(digits=3)
+```
+
+Following table shows that high level of poverty, in combination with low education and high unemployment, is associated with high exposure to acetaldehyde.
+
+```{r}
+data.table(df)[grepl('Q4', RHS) &
+                 grepl('poverty_rate=Q4', LHS)][order(-confidence)] %>%
+  kable(digits = 3)
+```
+
+We will examine counties with low exposure to pollutants from emissions. Counties with declining population (out migration), high death rate (older people) and low unemployment (possibly retired) have low exposure to all pollutants.
+
+
+```{r}
+data.table(df)[grepl('Q1', RHS)][order(-confidence)] %>% 
+  kable(digits=3)
+```
+
+Finally, we examine the associations within socio-economic factors. In the *Apriori* algorithm we set both LHS and RHS to be socio-economic factors.
+
+Following table illustrates that association between high poverty and low education (and vice versa), high unemployment and low education, low unemployment and low poverty, and so on. 
+
+```{r}
+s_rules <- apriori(
+  trans,
+  parameter = list(sup = 0.1,
+                   conf = 0.5, target = "rules"),
+  appearance = list(none = unique(chem_qrt$Label)),
+  control = list(verbose = F)
+)
+sdf <- DATAFRAME(s_rules)[, c(1:4, 6:7)]
+data.table(sdf)[order(-confidence)] %>% kable(digits=3)
+```
+
+
+
+## Visualize association rules
+
+
+```{r fig.height=10, fig.width=7}
+## grouped matrix plot
+plot(rules, method="grouped")
+```
+
